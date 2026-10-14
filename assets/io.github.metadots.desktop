@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=MetaDots
+GenericName=Audio Tag Editor
+Comment=Edit and organize audio metadata
+Exec=metadots %F
+Icon=io.github.metadots-symbolic
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+MimeType=audio/mpeg;audio/flac;audio/ogg;audio/x-vorbis+ogg;audio/opus;audio/mp4;audio/x-wav;audio/x-aiff;audio/x-wavpack;
+StartupNotify=true
