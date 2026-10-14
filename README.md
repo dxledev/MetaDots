@@ -28,6 +28,8 @@ Launch `metadots`, pass files or folders as arguments, or drop files into the wi
 
 Supported formats include MP3, FLAC, Ogg Vorbis, Opus, MP4/M4A, WAV, AIFF, APE, WavPack and the other formats handled by TagLib. The editor exposes title, artist, album, album artist, track, disc, date, genre, composer, comment and copyright. Other tags and embedded artwork are preserved when saving. Saves use a temporary sibling file and reject conflicting external modifications. Each file is committed separately, and failed edits stay pending. Symlinks and multiply linked files are rejected for writing.
 
+Explicit: the Explicit box under Title adds or removes the boxed E (🅴, U+1F174) that Apple Music shows after explicit titles, at the end of the title of every selected file. Tags can't carry colours, so it is a text character: it draws in whatever colour the player uses for titles, and players without a font for it may show a blank box. It is part of the title text only (no advisory tag is written), it is not copied to the next file, and files with no title are skipped. A title that already ends in the character shows as explicit.
+
 Cover art: the editor shows the selected file's cover, or "Mixed covers" when the selection differs. Choose image… opens a JPEG or PNG from the in-window browser (it starts in the file's folder), or drop an image on the cover. Remove cover stages a removal. Both work on every selected file, are reviewed and saved like other edits, and replace only the front-cover, untyped and "Other" pictures; back covers, artist photos and other typed pictures stay. Covers are stored as ID3 `APIC`, FLAC and Ogg pictures, or MP4 `covr`, and images over 16 MB are rejected.
 
 ## CLI theming

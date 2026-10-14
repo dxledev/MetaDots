@@ -48,6 +48,7 @@ private:
     std::map<std::string, std::string> carry_;
     unsigned carry_generation_{};
     GtkWidget* carry_toggle_{};
+    GtkWidget* explicit_toggle_{};
     std::optional<CoverChange> carry_cover_;
     std::uint64_t carry_cover_hash_{};
     GtkWidget *cover_frame_{}, *cover_stack_{}, *cover_picture_{}, *cover_note_{}, *cover_info_{}, *cover_remove_{};
@@ -84,6 +85,9 @@ private:
     std::vector<std::size_t> selected() const;
     void refresh_editor();
     void edit_field(const std::string& key);
+    void stage_tag(Document& document, const std::string& key, const std::string& text);
+    void refresh_explicit();
+    void toggle_explicit();
     void clear_field(const std::string& key);
     std::string apply_carry();
     GtkWidget* build_cover();

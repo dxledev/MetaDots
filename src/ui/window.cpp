@@ -12,6 +12,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 
 namespace metadots {
 namespace {
@@ -48,6 +49,25 @@ std::string value(const Document& document, const std::string& key) {
     if (const auto found = document.pending.find(key); found != document.pending.end()) return found->second;
     if (const auto found = document.track.tags.find(key); found != document.track.tags.end()) return found->second;
     return {};
+}
+
+// Apple Music marks explicit songs with a boxed "E". Tags are plain text, so the title ends with
+// U+1F174 (negative squared E), which draws that box in the text colour with the E cut out of it.
+constexpr std::string_view explicit_suffix = " \xF0\x9F\x85\xB4";
+
+bool has_explicit(const std::string& title) {
+    return title.size() > explicit_suffix.size() && title.compare(title.size() - explicit_suffix.size(), explicit_suffix.size(), explicit_suffix) == 0;
+}
+
+std::string with_explicit(std::string title) {
+    while (!title.empty() && g_ascii_isspace(static_cast<guchar>(title.back()))) title.pop_back();
+    if (title.empty() || has_explicit(title)) return title;
+    return title + std::string(explicit_suffix);
+}
+
+std::string without_explicit(std::string title) {
+    if (has_explicit(title)) title.resize(title.size() - explicit_suffix.size());
+    return title;
 }
 
 std::string folded(const std::string& text) {
@@ -573,6 +593,13 @@ GtkWidget* Window::build_editor() {
         gtk_grid_attach(GTK_GRID(editor_), name, 0, row, 1, 1);
         gtk_grid_attach(GTK_GRID(editor_), entry, 1, row, 1, 1);
         ++row;
+        if (std::string_view(key) == "title") {
+            explicit_toggle_ = gtk_check_button_new_with_label("Explicit");
+            gtk_widget_set_tooltip_text(explicit_toggle_, "Adds or removes the boxed E that Apple Music shows after explicit titles (a 🅴 character at the end of the title)");
+            connect_action(explicit_toggle_, "toggled", [this] { if (!updating_) toggle_explicit(); });
+            gtk_grid_attach(GTK_GRID(editor_), explicit_toggle_, 1, row, 1, 1);
+            ++row;
+        }
     }
     gtk_box_append(GTK_BOX(wrapper), scroll(editor_));
     carry_toggle_ = gtk_check_button_new_with_label("Copy my last edits to the next file");
@@ -814,9 +841,36 @@ void Window::refresh_editor() {
         const auto text = track.format + " · " + duration(track.duration_seconds) + " · " + std::to_string(track.bitrate_kbps) + " kbps · " + std::to_string(track.sample_rate) + " Hz";
         gtk_label_set_text(GTK_LABEL(details_), text.c_str());
     } else gtk_label_set_text(GTK_LABEL(details_), indices.empty() ? "Select a file to inspect its metadata." : "Only fields you change are applied to every selected file.");
+    refresh_explicit();
     updating_ = false;
     refresh_cover();
     refresh_dirty();
+}
+
+void Window::refresh_explicit() {
+    const auto indices = selected();
+    const auto count = std::count_if(indices.begin(), indices.end(), [&](std::size_t index) { return has_explicit(value(documents_[index], "title")); });
+    const bool was_updating = updating_;
+    updating_ = true;
+    gtk_check_button_set_inconsistent(GTK_CHECK_BUTTON(explicit_toggle_), false);
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(explicit_toggle_), !indices.empty() && count == static_cast<std::ptrdiff_t>(indices.size()));
+    gtk_check_button_set_inconsistent(GTK_CHECK_BUTTON(explicit_toggle_), count != 0 && count != static_cast<std::ptrdiff_t>(indices.size()));
+    updating_ = was_updating;
+}
+
+void Window::toggle_explicit() {
+    const bool on = gtk_check_button_get_active(GTK_CHECK_BUTTON(explicit_toggle_));
+    std::size_t skipped = 0;
+    for (const auto index : selected()) {
+        auto& document = documents_[index];
+        const auto current = value(document, "title");
+        // Without a title there is nothing for the badge to follow.
+        if (on && with_explicit(current).empty()) { ++skipped; continue; }
+        stage_tag(document, "title", on ? with_explicit(current) : without_explicit(current));
+    }
+    // Titles differ between files, so refresh the entry and toggle rather than writing one text into all of them.
+    refresh_editor();
+    if (skipped) set_status(std::to_string(skipped) + (skipped == 1 ? " file has" : " files have") + " no title yet, so no explicit mark was added.");
 }
 
 void Window::edit_field(const std::string& key) {
@@ -824,13 +878,15 @@ void Window::edit_field(const std::string& key) {
     const auto indices = selected();
     // Title and track number belong to one recording, so only album-wide tags are remembered.
     if (!indices.empty() && key != "title" && key != "track") { carry_[key] = text; ++carry_generation_; }
-    for (const auto index : indices) {
-        auto& document = documents_[index];
-        const auto original = document.track.tags.find(key);
-        if (text == (original == document.track.tags.end() ? "" : original->second)) document.pending.erase(key);
-        else document.pending[key] = text;
-    }
+    for (const auto index : indices) stage_tag(documents_[index], key, text);
+    if (key == "title") refresh_explicit();
     refresh_dirty();
+}
+
+void Window::stage_tag(Document& document, const std::string& key, const std::string& text) {
+    const auto original = document.track.tags.find(key);
+    if (text == (original == document.track.tags.end() ? "" : original->second)) document.pending.erase(key);
+    else document.pending[key] = text;
 }
 
 std::string Window::apply_carry() {
@@ -1196,6 +1252,35 @@ bool Window::self_test(const std::filesystem::path& screenshots, bool capture_mo
     require(indicator && std::string(gtk_label_get_text(GTK_LABEL(indicator))) == "●", "Dirty row indicator was not updated after editing");
     for (auto& document : documents_) document.pending.clear();
     carry_.clear();
+    // The explicit mark is a per-file suffix, so toggling a mixed selection keeps every title.
+    refresh_editor();
+    auto* explicit_box = GTK_CHECK_BUTTON(explicit_toggle_);
+    require(!gtk_check_button_get_active(explicit_box) && !gtk_check_button_get_inconsistent(explicit_box), "Explicit toggle starts checked");
+    gtk_check_button_set_active(explicit_box, true);
+    const std::string mark(explicit_suffix);
+    require(documents_[0].pending.at("title") == "First title" + mark && documents_[1].pending.at("title") == "Second title" + mark, "Explicit toggle did not keep each file's own title");
+    require(gtk_check_button_get_active(explicit_box) && !gtk_check_button_get_inconsistent(explicit_box), "Explicit toggle did not stay checked");
+    gtk_check_button_set_active(explicit_box, false);
+    require(dirty_count() == 0, "Explicit toggle off did not drop the pending titles");
+    documents_[0].track.tags["title"] = "Already" + mark;
+    refresh_editor();
+    require(gtk_check_button_get_inconsistent(explicit_box), "Mixed explicit state was not shown");
+    gtk_check_button_set_active(explicit_box, true);
+    require(documents_[1].pending.at("title") == "Second title" + mark && !documents_[0].pending.count("title"), "Explicit toggle doubled the mark");
+    gtk_check_button_set_active(explicit_box, false);
+    require(documents_[0].pending.at("title") == "Already" && documents_[1].pending.count("title") == 0, "Explicit toggle off did not strip the mark");
+    for (auto& document : documents_) document.pending.clear();
+    documents_[0].track.tags["title"] = "First title";
+    gtk_list_box_unselect_all(GTK_LIST_BOX(files_));
+    gtk_list_box_select_row(GTK_LIST_BOX(files_), gtk_list_box_get_row_at_index(GTK_LIST_BOX(files_), 0));
+    gtk_editable_set_text(GTK_EDITABLE(fields_.at("title")), ("Typed by hand" + mark).c_str());
+    require(gtk_check_button_get_active(explicit_box), "Typing the mark did not check the toggle");
+    gtk_editable_set_text(GTK_EDITABLE(fields_.at("title")), "");
+    gtk_check_button_set_active(explicit_box, true);
+    require(!documents_[0].pending.count("title") || documents_[0].pending.at("title").empty(), "Explicit toggle invented a title");
+    require(!gtk_check_button_get_active(explicit_box), "Explicit toggle stayed on for an empty title");
+    for (auto& document : documents_) document.pending.clear();
+    refresh_editor();
     gtk_list_box_unselect_all(GTK_LIST_BOX(files_));
     gtk_list_box_select_row(GTK_LIST_BOX(files_), gtk_list_box_get_row_at_index(GTK_LIST_BOX(files_), 0));
     gtk_editable_set_text(GTK_EDITABLE(fields_.at("artist")), "Carried artist");
