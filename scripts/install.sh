@@ -82,6 +82,7 @@ install_desktop() {
     local registered="$install_prefix/share/applications/$desktop_id.desktop"
     local icon="$install_prefix/share/icons/hicolor/symbolic/apps/$desktop_id-symbolic.svg"
     /usr/bin/install -Dm644 -- "$project_directory/assets/$desktop_id-symbolic.svg" "$icon"
+    /usr/bin/install -Dm644 -- "$project_directory/assets/$desktop_id.svg" "$install_prefix/share/icons/hicolor/scalable/apps/$desktop_id.svg"
     /usr/bin/mkdir -p -- "${desktop%/*}" "${registered%/*}"
     backup_file "$desktop"
     local temporary
@@ -100,7 +101,7 @@ register_app() {
     backup_file "$apps_list"
     local temporary
     temporary="$(/usr/bin/mktemp "${apps_list%/*}/.metadots-apps.XXXXXX")"
-    local entry="$desktop_id.desktop|$install_prefix/share/icons/hicolor/symbolic/apps/$desktop_id-symbolic.svg|MetaDots"
+    local entry="$desktop_id.desktop|$install_prefix/share/icons/hicolor/scalable/apps/$desktop_id.svg|MetaDots"
     if [[ -f "$apps_list" ]]; then
         /usr/bin/awk -F '|' -v id="$desktop_id.desktop" -v entry="$entry" \
             '$1 == id { if (!found++) print entry; next } { print } END { if (!found) print entry }' "$apps_list" > "$temporary"
