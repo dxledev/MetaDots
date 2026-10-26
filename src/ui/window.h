@@ -1,5 +1,6 @@
 #pragma once
 #include "core/metadata.h"
+#include "core/settings.h"
 #include "core/theme.h"
 #include <gtk/gtk.h>
 #include <functional>
@@ -32,8 +33,16 @@ public:
     void present();
     bool self_test(const std::filesystem::path& screenshots, bool capture_modal = false);
 private:
-    GtkWidget *window_{}, *overlay_{}, *content_{}, *blur_{}, *modal_{}, *modal_card_{}, *modal_viewport_{}, *modal_feedback_{};
+    GtkWidget *window_{}, *overlay_{}, *content_{}, *blur_{}, *modal_{}, *shade_{}, *scale_{}, *modal_card_{}, *modal_viewport_{}, *modal_feedback_{};
     GtkWidget *files_{}, *search_{}, *editor_{}, *selection_label_{}, *details_{}, *status_{}, *save_{};
+    // shade_ is the visible modal layer: it is modal_ while one is open and outlives it while fading out.
+    double modal_progress_{}, motion_from_{}, motion_target_{};
+    gint64 motion_start_{};
+    guint motion_tick_{};
+    Settings settings_;
+    std::filesystem::path settings_file_;
+    std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
+    GCancellable* picker_cancel_{};
     GtkCssProvider* css_{};
     GdkDisplay* display_{};
     guint timer_{};
@@ -107,6 +116,16 @@ private:
                     const std::string& confirm, std::function<void()> action);
     GtkWidget* begin_modal(const std::string& title);
     void dismiss_modal();
+    void animate_modal(double target);
+    void set_modal_progress(double progress);
+    void finish_fade();
+    void set_content_inert(bool inert);
+    void request_open();
+    void open_menu();
+    void open_settings();
+    enum class Pick { Files, Folder, Subfolders, Image };
+    void system_pick(Pick pick);
+    void save_settings_now();
     void open_browser(bool images = false);
     void browse(const std::filesystem::path& path);
     void browser_accept();

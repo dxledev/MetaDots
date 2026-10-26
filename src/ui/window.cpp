@@ -1,12 +1,14 @@
 #include "window.h"
 #include "blur_bin.h"
 #include "core/gtk_config.h"
+#include "core/settings.h"
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <cmath>
 #include <unistd.h>
 #include <memory>
 #include <set>
@@ -130,6 +132,8 @@ Window::Window(GtkApplication* application, std::filesystem::path config,
     try {
         ensure_theme(config_);
         theme_ = sync_theme(config_);
+        settings_file_ = settings_path(config_);
+        settings_ = load_settings(settings_file_);
         window_ = gtk_application_window_new(application);
         g_object_ref(window_);
         display_ = gdk_display_get_default();
@@ -159,6 +163,9 @@ Window::~Window() { cleanup(); }
 
 void Window::close_window() noexcept {
     closing_ = true;
+    if (picker_cancel_) g_cancellable_cancel(picker_cancel_);
+    if (motion_tick_ && window_ && !destroyed_) gtk_widget_remove_tick_callback(window_, motion_tick_);
+    motion_tick_ = 0;
     if (theme_monitor_) {
         if (theme_monitor_handler_) {
             g_signal_handler_disconnect(theme_monitor_, theme_monitor_handler_);
@@ -179,6 +186,7 @@ void Window::close_window() noexcept {
 void Window::cleanup() noexcept {
     close_window();
     g_clear_object(&cover_texture_);
+    g_clear_object(&picker_cancel_);
     if (window_) {
         g_object_unref(window_);
         window_ = nullptr;
@@ -202,6 +210,7 @@ void Window::guarded(const std::function<void()>& action) noexcept {
 void Window::show_error(const char* message) noexcept {
     if (closing_) return;
     if (status_) gtk_label_set_text(GTK_LABEL(status_), message);
+    if (blur_) metadots_blur_bin_invalidate(blur_);
     if (modal_feedback_) {
         gtk_label_set_text(GTK_LABEL(modal_feedback_), message);
         gtk_widget_set_visible(modal_feedback_, true);
@@ -285,7 +294,7 @@ void Window::setup_keyboard() {
         bool handled = true;
         self.guarded([&] {
             switch (gdk_keyval_to_lower(key)) {
-                case GDK_KEY_o: self.open_browser(); break;
+                case GDK_KEY_o: self.request_open(); break;
                 case GDK_KEY_s: self.request_save(); break;
                 case GDK_KEY_a: {
                     auto* focus = gtk_root_get_focus(GTK_ROOT(self.window_));
@@ -338,7 +347,8 @@ GtkWidget* Window::build_header() {
     gtk_box_append(GTK_BOX(brand), mark);
     gtk_box_append(GTK_BOX(brand), label("MetaDots", "brand"));
     gtk_header_bar_set_title_widget(GTK_HEADER_BAR(header), brand);
-    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), button("Open", "folder-open-symbolic", [this] { open_browser(); }));
+    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), button("Open", "folder-open-symbolic", [this] { request_open(); }));
+    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), button("Settings", "preferences-system-symbolic", [this] { open_settings(); }));
     save_ = button("Save changes", "document-save-symbolic", [this] { request_save(); });
     gtk_widget_add_css_class(save_, "suggested-action");
     gtk_header_bar_pack_end(GTK_HEADER_BAR(header), save_);
@@ -511,7 +521,8 @@ void Window::refresh_cover() {
 
 void Window::choose_cover() {
     if (selected().empty()) return;
-    open_browser(true);
+    if (settings_.use_native_picker) open_browser(true);
+    else system_pick(Pick::Image);
 }
 
 void Window::remove_cover() {
@@ -613,6 +624,7 @@ GtkWidget* Window::build_editor() {
 
 void Window::set_status(const std::string& message) {
     if (status_ && !closing_) gtk_label_set_text(GTK_LABEL(status_), message.c_str());
+    if (blur_) metadots_blur_bin_invalidate(blur_);
 }
 
 void Window::apply_theme(const Theme& theme) {
@@ -682,6 +694,7 @@ void Window::apply_theme(const Theme& theme) {
         << ".metadots scrollbar { background: transparent; } .metadots scrollbar slider { background: " << tone(".22") << "; border-radius: 5px; min-width: 5px; min-height: 28px; }\n"
         << ".metadots scrollbar.hovering slider { background: " << tone(".42") << "; }\n";
     gtk_css_provider_load_from_string(css_, css.str().c_str());
+    if (blur_) metadots_blur_bin_invalidate(blur_);
     theme_ = theme;
 }
 
@@ -949,6 +962,11 @@ void Window::refresh_dirty() {
 
 GtkWidget* Window::begin_modal(const std::string& title) {
     dismiss_modal();
+    // A modal still fading out is replaced in place; the new one picks up its progress so nothing dips.
+    if (shade_) {
+        gtk_overlay_remove_overlay(GTK_OVERLAY(overlay_), shade_);
+        shade_ = scale_ = nullptr;
+    }
     modal_ = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_widget_add_css_class(modal_, "modal-shade");
     gtk_widget_set_hexpand(modal_, true);
@@ -968,13 +986,18 @@ GtkWidget* Window::begin_modal(const std::string& title) {
     gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(modal_viewport_), true);
     gtk_scrolled_window_set_propagate_natural_width(GTK_SCROLLED_WINDOW(modal_viewport_), true);
     gtk_scrolled_window_set_max_content_height(GTK_SCROLLED_WINDOW(modal_viewport_), 650);
-    gtk_widget_set_halign(modal_viewport_, GTK_ALIGN_CENTER);
-    gtk_widget_set_valign(modal_viewport_, GTK_ALIGN_CENTER);
-    margins(modal_viewport_, 24);
-    gtk_box_append(GTK_BOX(modal_), modal_viewport_);
+    scale_ = metadots_scale_bin_new(modal_viewport_);
+    gtk_widget_set_hexpand(scale_, true);
+    gtk_widget_set_vexpand(scale_, true);
+    gtk_widget_set_halign(scale_, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(scale_, GTK_ALIGN_CENTER);
+    margins(scale_, 24);
+    gtk_box_append(GTK_BOX(modal_), scale_);
+    shade_ = modal_;
+    set_modal_progress(modal_progress_);
     gtk_overlay_add_overlay(GTK_OVERLAY(overlay_), modal_);
-    gtk_widget_set_sensitive(content_, false);
-    metadots_blur_bin_set_blur(blur_, true);
+    set_content_inert(true);
+    animate_modal(1);
     auto* outside = gtk_gesture_click_new();
     g_signal_connect(outside, "released", G_CALLBACK((+[](GtkGestureClick*, int, double x, double y, gpointer data) {
         auto& self = *static_cast<Window*>(data);
@@ -1013,13 +1036,191 @@ void Window::show_modal(const std::string& title, const std::string& message,
 
 void Window::dismiss_modal() {
     if (!modal_) return;
-    auto* old = modal_;
+    // The widgets stay on screen while they fade, but they no longer take clicks.
+    gtk_widget_set_can_target(modal_, false);
     modal_ = modal_card_ = modal_viewport_ = modal_feedback_ = browser_entry_ = browser_list_ = nullptr;
     modal_action_ = {};
-    gtk_overlay_remove_overlay(GTK_OVERLAY(overlay_), old);
-    gtk_widget_set_sensitive(content_, true);
-    metadots_blur_bin_set_blur(blur_, false);
+    set_content_inert(false);
     gtk_widget_grab_focus(search_);
+    animate_modal(0);
+}
+
+// Insensitive widgets restyle as disabled, which would pop visibly behind a fading shade.
+void Window::set_content_inert(bool inert) {
+    gtk_widget_set_can_target(content_, !inert);
+    gtk_widget_set_can_focus(content_, !inert);
+}
+
+void Window::set_modal_progress(double progress) {
+    modal_progress_ = progress;
+    if (shade_) gtk_widget_set_opacity(shade_, progress);
+    if (scale_) metadots_scale_bin_set_scale(scale_, .98 + .02 * progress);
+    metadots_blur_bin_set_blur(blur_, progress);
+}
+
+void Window::finish_fade() {
+    if (modal_progress_ > 0 || modal_ || !shade_) return;
+    gtk_overlay_remove_overlay(GTK_OVERLAY(overlay_), shade_);
+    shade_ = scale_ = nullptr;
+}
+
+// Same motion as Solitare's modals: 120 ms, ease-out cubic, fade with a 0.98 to 1 scale.
+void Window::animate_modal(double target) {
+    gboolean animations = true;
+    g_object_get(gtk_settings_get_for_display(display_), "gtk-enable-animations", &animations, nullptr);
+    motion_target_ = target;
+    motion_from_ = modal_progress_;
+    motion_start_ = 0;
+    if (motion_from_ == target || !animations || !gtk_widget_get_mapped(window_)) {
+        if (motion_tick_) { gtk_widget_remove_tick_callback(window_, motion_tick_); motion_tick_ = 0; }
+        set_modal_progress(target);
+        finish_fade();
+        return;
+    }
+    if (motion_tick_) return;
+    motion_tick_ = gtk_widget_add_tick_callback(window_, +[](GtkWidget*, GdkFrameClock* clock, gpointer data) -> gboolean {
+        auto& self = *static_cast<Window*>(data);
+        const gint64 now = gdk_frame_clock_get_frame_time(clock);
+        if (!self.motion_start_) self.motion_start_ = now;
+        const double t = std::min(1.0, static_cast<double>(now - self.motion_start_) / 120000.0);
+        const double eased = 1 - std::pow(1 - t, 3);
+        self.set_modal_progress(self.motion_from_ + (self.motion_target_ - self.motion_from_) * eased);
+        if (t < 1) return G_SOURCE_CONTINUE;
+        self.motion_tick_ = 0;
+        self.finish_fade();
+        return G_SOURCE_REMOVE;
+    }, this, nullptr);
+}
+
+void Window::request_open() {
+    if (settings_.use_native_picker) open_browser();
+    else open_menu();
+}
+
+// The system chooser picks either files or a folder, never both, so the choice comes first.
+void Window::open_menu() {
+    auto* card = begin_modal("Open audio files");
+    auto* body = label("The system file picker opens next.", "muted");
+    gtk_box_append(GTK_BOX(card), body);
+    const std::array<std::pair<const char*, Pick>, 3> choices{{
+        {"Choose audio files…", Pick::Files}, {"Choose a folder…", Pick::Folder},
+        {"Choose a folder with its subfolders…", Pick::Subfolders}}};
+    GtkWidget* first = nullptr;
+    for (const auto& [text, pick] : choices) {
+        auto* choice = button(text, nullptr, [this, pick = pick] { dismiss_modal(); system_pick(pick); });
+        if (!first) first = choice;
+        gtk_box_append(GTK_BOX(card), choice);
+    }
+    auto* actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_halign(actions, GTK_ALIGN_END);
+    gtk_box_append(GTK_BOX(actions), button("Cancel", nullptr, [this] { dismiss_modal(); }));
+    gtk_box_append(GTK_BOX(card), actions);
+    gtk_widget_grab_focus(first);
+}
+
+void Window::system_pick(Pick pick) {
+    struct Request { Window* owner; std::weak_ptr<bool> alive; Pick pick; };
+    if (!picker_cancel_) picker_cancel_ = g_cancellable_new();
+    std::unique_ptr<GtkFileDialog, decltype(&g_object_unref)> dialog(gtk_file_dialog_new(), g_object_unref);
+    const bool image = pick == Pick::Image;
+    gtk_file_dialog_set_title(dialog.get(), image ? "Choose cover image" : pick == Pick::Files ? "Open audio files" : "Open folder");
+    if (pick == Pick::Files || image) {
+        auto* filter = gtk_file_filter_new();
+        gtk_file_filter_set_name(filter, image ? "JPEG and PNG images" : "Audio files");
+        if (image) { gtk_file_filter_add_mime_type(filter, "image/jpeg"); gtk_file_filter_add_mime_type(filter, "image/png"); }
+        else gtk_file_filter_add_mime_type(filter, "audio/*");
+        auto* filters = g_list_store_new(GTK_TYPE_FILE_FILTER);
+        g_list_store_append(filters, filter);
+        gtk_file_dialog_set_filters(dialog.get(), G_LIST_MODEL(filters));
+        g_object_unref(filter);
+        g_object_unref(filters);
+    }
+    // Like the in-window browser: covers start beside the selected file, everything else where the last pick ended.
+    auto start = browser_path_;
+    const auto chosen = selected();
+    if (image && !chosen.empty()) start = documents_[chosen.front()].track.path.parent_path();
+    std::error_code ignored;
+    if (start.empty() || !std::filesystem::is_directory(start, ignored)) start = g_get_home_dir();
+    std::unique_ptr<GFile, decltype(&g_object_unref)> folder(g_file_new_for_path(start.c_str()), g_object_unref);
+    gtk_file_dialog_set_initial_folder(dialog.get(), folder.get());
+    auto* pending = new Request{this, alive_, pick};
+    const auto finish = [](GObject* source, GAsyncResult* result, gpointer data) {
+        std::unique_ptr<Request> request(static_cast<Request*>(data));
+        auto* chooser = GTK_FILE_DIALOG(source);
+        GError* error = nullptr;
+        std::vector<std::filesystem::path> paths;
+        const auto add = [&](GFile* file) {
+            if (!file) return;
+            if (auto* path = g_file_get_path(file)) { paths.emplace_back(path); g_free(path); }
+        };
+        switch (request->pick) {
+            case Pick::Files: {
+                std::unique_ptr<GListModel, decltype(&g_object_unref)> files(gtk_file_dialog_open_multiple_finish(chooser, result, &error), g_object_unref);
+                if (files) for (guint index = 0; index < g_list_model_get_n_items(files.get()); ++index) {
+                    std::unique_ptr<GFile, decltype(&g_object_unref)> file(static_cast<GFile*>(g_list_model_get_item(files.get(), index)), g_object_unref);
+                    add(file.get());
+                }
+                break;
+            }
+            case Pick::Image: {
+                std::unique_ptr<GFile, decltype(&g_object_unref)> file(gtk_file_dialog_open_finish(chooser, result, &error), g_object_unref);
+                add(file.get());
+                break;
+            }
+            default: {
+                std::unique_ptr<GFile, decltype(&g_object_unref)> file(gtk_file_dialog_select_folder_finish(chooser, result, &error), g_object_unref);
+                add(file.get());
+            }
+        }
+        std::string message;
+        // Closing the chooser without picking anything is not an error.
+        if (error && !g_error_matches(error, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_DISMISSED) &&
+            !g_error_matches(error, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_CANCELLED) &&
+            !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) message = error->message ? error->message : "The file picker failed.";
+        g_clear_error(&error);
+        if (!request->alive.lock() || request->owner->closing_) return;
+        auto& self = *request->owner;
+        if (!message.empty()) { self.show_error(message.c_str()); return; }
+        if (paths.empty()) return;
+        self.guarded([&] {
+            if (request->pick == Pick::Image) self.set_cover_from_file(paths.front());
+            else {
+                if (request->pick != Pick::Files && std::filesystem::is_directory(paths.front())) self.browser_path_ = paths.front();
+                self.open_paths(paths, request->pick == Pick::Subfolders);
+            }
+        });
+    };
+    switch (pick) {
+        case Pick::Files: gtk_file_dialog_open_multiple(dialog.get(), GTK_WINDOW(window_), picker_cancel_, finish, pending); break;
+        case Pick::Image: gtk_file_dialog_open(dialog.get(), GTK_WINDOW(window_), picker_cancel_, finish, pending); break;
+        default: gtk_file_dialog_select_folder(dialog.get(), GTK_WINDOW(window_), picker_cancel_, finish, pending);
+    }
+}
+
+void Window::save_settings_now() {
+    save_settings(settings_file_, settings_);
+}
+
+void Window::open_settings() {
+    auto* card = begin_modal("Settings");
+    auto* toggle = gtk_check_button_new_with_label("Use native picker");
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(toggle), settings_.use_native_picker);
+    connect_action(toggle, "toggled", [this, toggle] {
+        settings_.use_native_picker = gtk_check_button_get_active(GTK_CHECK_BUTTON(toggle));
+        save_settings_now();
+    });
+    gtk_box_append(GTK_BOX(card), toggle);
+    auto* note = label("On: MetaDots' own file browser inside this window. Off: your system's file picker.", "muted");
+    gtk_label_set_wrap(GTK_LABEL(note), true);
+    gtk_label_set_max_width_chars(GTK_LABEL(note), 54);
+    gtk_box_append(GTK_BOX(card), note);
+    auto* actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_halign(actions, GTK_ALIGN_END);
+    auto* done = button("Done", nullptr, [this] { dismiss_modal(); });
+    gtk_widget_add_css_class(done, "suggested-action");
+    gtk_box_append(GTK_BOX(actions), done);
+    gtk_box_append(GTK_BOX(card), actions);
+    gtk_widget_grab_focus(toggle);
 }
 
 void Window::request_save() {
@@ -1212,12 +1413,23 @@ bool Window::self_test(const std::filesystem::path& screenshots, bool capture_mo
     refresh_theme();
     show_modal("Embedded modal", "All dialogs stay inside MetaDots. The content behind this card is blurred.", "Close", [] {});
     require(modal_ && !GTK_IS_WINDOW(modal_), "Modal created an external window");
-    require(!gtk_widget_get_sensitive(content_), "Background remains interactive");
+    require(!gtk_widget_get_can_target(content_) && !gtk_widget_get_can_focus(content_), "Background remains interactive");
     require(g_list_model_get_n_items(gtk_window_get_toplevels()) == 1, "More than one top-level window");
     auto* modal_actions = gtk_widget_get_last_child(modal_card_);
     g_signal_emit_by_name(gtk_widget_get_last_child(modal_actions), "clicked");
     require(!modal_, "Modal action did not dismiss its own widget");
-    require(gtk_widget_get_sensitive(content_), "Dismiss did not restore content");
+    require(gtk_widget_get_can_target(content_) && gtk_widget_get_can_focus(content_), "Dismiss did not restore content");
+    // A closing modal fades in place, and a modal opened meanwhile takes over at the same progress.
+    show_modal("Handoff", "Replaces a fading modal.", "Close", [] {});
+    set_modal_progress(.6);
+    dismiss_modal();
+    require(!modal_ && shade_ && gtk_widget_get_opacity(shade_) == .6, "Closing modal lost its progress");
+    show_modal("Handoff", "Replaces a fading modal.", "Close", [] {});
+    require(modal_ == shade_ && modal_progress_ == .6 && gtk_widget_get_opacity(shade_) == .6, "Handoff did not keep the modal progress");
+    set_modal_progress(0);
+    dismiss_modal();
+    finish_fade();
+    require(!shade_ && !modal_, "Faded modal stayed on screen");
     if (!documents_.empty()) {
         gtk_list_box_select_all(GTK_LIST_BOX(files_));
         const auto count = selected().size();
@@ -1392,6 +1604,12 @@ int run_window(const std::filesystem::path& config, const std::vector<std::files
     } view_cleanup{gtk_view};
     g_setenv("XDG_CONFIG_HOME", gtk_view.c_str(), true);
     g_setenv("GSK_RENDERER", "cairo", false);
+    // The system file picker only works through the desktop portal, which GTK skips outside a sandbox.
+    {
+        const char* debug = std::getenv("GDK_DEBUG");
+        const std::string flags = debug && *debug ? std::string(debug) + ",portals" : "portals";
+        g_setenv("GDK_DEBUG", flags.c_str(), true);
+    }
     auto* application = gtk_application_new("io.github.metadots", G_APPLICATION_NON_UNIQUE);
     context.application = application;
     g_set_application_name("MetaDots");
